@@ -133,31 +133,41 @@ class SystemTrayApp(QSystemTrayIcon):
 
     def set_state(self, new_state):
         """Centralized state machine update and icon switching."""
-        if self.state != new_state:
-            old_state = self.state
+
+        old_state = self.state
+
+        if old_state != new_state:
             self.state = new_state
 
-            # --- UPDATED ICON LOGIC and TIMER MANAGEMENT ---
+            # 1. Determine the icon and timer actions
             if new_state == "SUSPENDED":
-                self.set_icon(ICON_SUSPENDED)
+                icon_to_set = ICON_SUSPENDED
                 self.idle_timer.stop()
                 self.process_timer.stop()
             elif new_state == "IDLE_DETECTING":
-                self.set_icon(ICON_IDLE)
-                # Start the recurring idle check
+                icon_to_set = ICON_IDLE
                 self.idle_timer.start(IDLE_CHECK_LOOP_MS)
                 self.process_timer.stop()
             elif new_state == "ERROR":
-                self.set_icon(ICON_ERROR)
+                icon_to_set = ICON_ERROR
                 self.idle_timer.stop()
                 self.process_timer.stop()
             else: # ACTIVE
-                self.set_icon(ICON_ACTIVE)
+                icon_to_set = ICON_ACTIVE
                 self.idle_timer.stop()
-                # Note: process_timer is started separately by process check methods
+
+            # 2. Force the icon change
+            self.set_icon(icon_to_set)
+
+            # 3. Aggressive Refresh Trick for KDE/Plasma Visual Caching
+            # Resetting the icon twice forces the Plasma shell to re-read the icon state.
+            current_icon = self.icon()
+            self.setIcon(QIcon()) # Set to empty icon
+            self.setIcon(current_icon) # Set back to the actual icon
 
             print(f"State changed from {old_state} to: {new_state}")
 
+        # Always update the tooltip, as this also prompts a redraw
         self.update_tooltip()
 
     def force_run_process_check(self):
@@ -267,7 +277,7 @@ class SystemTrayApp(QSystemTrayIcon):
     def check_runtime_status(self, startup_check=False):
         """
         Polls the runtime_status file to detect suspend/active events.
-        If in IDLE_DETECTING and runtime_status becomes 'active', immediately triggers a process check.
+        Crucially, the IDLE_DETECTING state ONLY looks for 'suspended' to allow the GPU to power down.
         """
         try:
             with open(RUNTIME_STATUS_PATH, 'r') as f:
@@ -292,11 +302,9 @@ class SystemTrayApp(QSystemTrayIcon):
                     # Transition to SUSPENDED is reliable
                     self.process_timer.stop()
                     self.set_state("SUSPENDED")
-                elif is_active:
-                    # If runtime status wakes up (is_active=True),
-                    # we IMMEDIATELY trigger the fast process check without waiting for the 30s timer.
-                    print("Runtime status active detected in IDLE_DETECTING. Forcing process check.")
-                    self.force_run_process_check()
+
+                # We ignore 'is_active' here to allow the GPU to suspend.
+                # Waking up is handled by the recurring 30s idle_timer loop.
 
             elif self.state == "SUSPENDED":
                 if is_active:
