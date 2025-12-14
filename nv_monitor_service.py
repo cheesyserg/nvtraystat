@@ -54,9 +54,8 @@ class SystemTrayApp(QSystemTrayIcon):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.check_status_and_metrics)
 
-        # --- IDLE TIMER (Now set up for continuous loop) ---
+        # --- IDLE TIMER (Continuous loop) ---
         self.idle_timer = QTimer(self)
-        # Note: setSingleShot(False) is the default, but we ensure it loops
         self.idle_timer.timeout.connect(self.check_process_after_idle_timeout)
         # ----------------------
 
@@ -142,12 +141,12 @@ class SystemTrayApp(QSystemTrayIcon):
             if new_state == "SUSPENDED":
                 self.set_icon(ICON_SUSPENDED)
                 self.idle_timer.stop()
-                self.process_timer.stop() # Ensure this is off too
+                self.process_timer.stop()
             elif new_state == "IDLE_DETECTING":
                 self.set_icon(ICON_IDLE)
                 # Start the recurring idle check
                 self.idle_timer.start(IDLE_CHECK_LOOP_MS)
-                self.process_timer.stop() # Ensure this is off too
+                self.process_timer.stop()
             elif new_state == "ERROR":
                 self.set_icon(ICON_ERROR)
                 self.idle_timer.stop()
@@ -268,7 +267,7 @@ class SystemTrayApp(QSystemTrayIcon):
     def check_runtime_status(self, startup_check=False):
         """
         Polls the runtime_status file to detect suspend/active events.
-        Crucially, the IDLE_DETECTING state ignores 'active' status to prevent looping.
+        If in IDLE_DETECTING and runtime_status becomes 'active', immediately triggers a process check.
         """
         try:
             with open(RUNTIME_STATUS_PATH, 'r') as f:
@@ -290,11 +289,14 @@ class SystemTrayApp(QSystemTrayIcon):
 
             if self.state == "IDLE_DETECTING":
                 if is_suspended:
-                    # ONLY transition to SUSPENDED if the file says so.
+                    # Transition to SUSPENDED is reliable
                     self.process_timer.stop()
                     self.set_state("SUSPENDED")
-
-                # We ignore 'is_active' here to prevent the IDLE_DETECTING/ACTIVE loop.
+                elif is_active:
+                    # If runtime status wakes up (is_active=True),
+                    # we IMMEDIATELY trigger the fast process check without waiting for the 30s timer.
+                    print("Runtime status active detected in IDLE_DETECTING. Forcing process check.")
+                    self.force_run_process_check()
 
             elif self.state == "SUSPENDED":
                 if is_active:
