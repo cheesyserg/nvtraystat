@@ -17,12 +17,13 @@ NVIDIA_SMI_STATUS_COMMAND = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.u
 # IMPORTANT: Replace 0000:01:00.0 with your actual NVIDIA GPU PCI address
 RUNTIME_STATUS_PATH = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
 COMMAND_TITLE = "GPU Processes"
-PROCESS_POLL_MS = 1000 # (for nvidia-smi process list - when ACTIVE)
-STATUS_POLL_MS = 1000 # (for runtime_status and overall GPU status check)
+PROCESS_POLL_MS = 1000 # 1 second (for nvidia-smi process list - when ACTIVE)
+STATUS_POLL_MS = 1000   # 1 second (for runtime_status and overall GPU status check)
 
-# --- IDLE TIMEOUT CONFIGURATION ---
-# The timer for recurring check when idle. Set to 30s to be less aggressive.
-IDLE_CHECK_LOOP_MS = 30000
+# --- IDLE CHECK CONFIGURATION ---
+FAST_CHECK_INTERVAL_MS = 1000  # Check interval for Stage 1 (1 second)
+FAST_CHECK_COUNT = 3           # Number of checks for Stage 1 (3 checks total)
+IDLE_CHECK_LOOP_MS = 30000     # Check interval for Stage 2 (30 seconds)
 # ----------------------------------
 
 # ICON CONFIGURATION (Using relative paths for custom icons, falling back to standard names)
@@ -42,11 +43,14 @@ class SystemTrayApp(QSystemTrayIcon):
         self.gpu_status_data = {"utilization": "N/A", "memory_used": "N/A"}
         self.icon_provider = QFileIconProvider()
 
+        # --- FAST CHECK STATE ---
+        self.fast_check_counter = 0
+
         self.set_icon(ICON_SUSPENDED)
         self.setToolTip("GPU Monitor: Initializing...")
 
         # --- TIMERS ---
-        # Timer for polling the process list (less frequent)
+        # Timer for polling the process list (when ACTIVE)
         self.process_timer = QTimer(self)
         self.process_timer.timeout.connect(self.run_nvidia_smi_processes)
 
@@ -54,9 +58,13 @@ class SystemTrayApp(QSystemTrayIcon):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.check_status_and_metrics)
 
-        # --- IDLE TIMER (Continuous loop) ---
+        # Timer for Stage 1: Fast initial check
+        self.fast_check_timer = QTimer(self)
+        self.fast_check_timer.timeout.connect(self.check_idle_process_activity)
+
+        # Timer for Stage 2: Slow recurring check (long loop)
         self.idle_timer = QTimer(self)
-        self.idle_timer.timeout.connect(self.check_process_after_idle_timeout)
+        self.idle_timer.timeout.connect(self.check_idle_process_activity)
         # ----------------------
 
         # --- MENU SETUP ---
@@ -77,6 +85,7 @@ class SystemTrayApp(QSystemTrayIcon):
         self.menu.aboutToShow.connect(self.update_process_menu)
 
         # --- STARTUP LOGIC ---
+        # Note: status_timer starts here. set_state is called inside check_status_and_metrics
         self.check_status_and_metrics(startup_check=True)
         self.status_timer.start(STATUS_POLL_MS)
 
@@ -132,35 +141,41 @@ class SystemTrayApp(QSystemTrayIcon):
         return data
 
     def set_state(self, new_state):
-        """Centralized state machine update and icon switching."""
+        """
+        Centralized state machine update, icon switching, and **TIMER MANAGEMENT**.
+        This ensures state and polling frequency are always synchronized.
+        """
 
         old_state = self.state
 
         if old_state != new_state:
             self.state = new_state
 
-            # 1. Determine the icon and timer actions
+            # --- TIMER CONTROL: STOP ALL IDLE/ACTIVE TIMERS ---
+            self.idle_timer.stop()
+            self.fast_check_timer.stop()
+            self.process_timer.stop()
+
+            # 1. Determine the icon and start the appropriate timer
             if new_state == "SUSPENDED":
                 icon_to_set = ICON_SUSPENDED
-                self.idle_timer.stop()
-                self.process_timer.stop()
             elif new_state == "IDLE_DETECTING":
                 icon_to_set = ICON_IDLE
-                self.idle_timer.start(IDLE_CHECK_LOOP_MS)
-                self.process_timer.stop()
+                # --- START STAGE 1 (Fast Check) ---
+                self.fast_check_counter = FAST_CHECK_COUNT
+                self.fast_check_timer.start(FAST_CHECK_INTERVAL_MS)
+                # -----------------------------------
             elif new_state == "ERROR":
                 icon_to_set = ICON_ERROR
-                self.idle_timer.stop()
-                self.process_timer.stop()
             else: # ACTIVE
                 icon_to_set = ICON_ACTIVE
-                self.idle_timer.stop()
+                # *** FIX: Start the ACTIVE POLLING TIMER HERE ***
+                self.process_timer.start(PROCESS_POLL_MS)
 
             # 2. Force the icon change
             self.set_icon(icon_to_set)
 
             # 3. Aggressive Refresh Trick for KDE/Plasma Visual Caching
-            # Resetting the icon twice forces the Plasma shell to re-read the icon state.
             current_icon = self.icon()
             self.setIcon(QIcon()) # Set to empty icon
             self.setIcon(current_icon) # Set back to the actual icon
@@ -173,7 +188,7 @@ class SystemTrayApp(QSystemTrayIcon):
     def force_run_process_check(self):
         """
         Forces nvidia-smi process check for menu update or idle timeout loop.
-        It transitions to ACTIVE only if processes are found AND the state is currently not ACTIVE.
+        Transitions to ACTIVE by calling set_state("ACTIVE").
         """
         try:
             result = subprocess.run(
@@ -187,15 +202,13 @@ class SystemTrayApp(QSystemTrayIcon):
             parsed_data = self.parse_nvidia_smi_output_processes(result.stdout)
 
             if parsed_data:
-                # Processes found. Update internal data.
+                # Processes found. Update internal data and switch to ACTIVE.
                 self.last_parsed_data = parsed_data
 
                 if self.state != "ACTIVE":
-                    # If processes are found while IDLE/SUSPENDED, switch to ACTIVE.
-                    self.set_state("ACTIVE")
-                    self.process_timer.start(PROCESS_POLL_MS)
+                    self.set_state("ACTIVE") # Timer starts inside set_state
             else:
-                # No processes found, just update internal list.
+                # No processes found
                 self.last_parsed_data = None
 
             return parsed_data
@@ -225,7 +238,6 @@ class SystemTrayApp(QSystemTrayIcon):
 
             if not parsed_data:
                 # Processes disappeared, switch to idle detection
-                self.process_timer.stop()
                 self.set_state("IDLE_DETECTING")
 
             # Update internal data
@@ -235,14 +247,35 @@ class SystemTrayApp(QSystemTrayIcon):
             self.last_parsed_data = [["Error", "Command Failed"]]
             self.set_state("ERROR")
 
-    def check_process_after_idle_timeout(self):
+    def check_idle_process_activity(self):
         """
-        Called by the recurring idle_timer.
-        Forces an nvidia-smi process check to see if any activity started.
+        Handles both Stage 1 (fast check) and Stage 2 (slow loop) idle checking.
+        This is called by both self.fast_check_timer and self.idle_timer.
         """
-        if self.state == "IDLE_DETECTING":
-            print(f"Idle check loop ({IDLE_CHECK_LOOP_MS/1000}s) forcing nvidia-smi process check.")
-            self.force_run_process_check()
+        if self.state != "IDLE_DETECTING":
+            return
+
+        # 1. Run the process check
+        parsed_data = self.force_run_process_check() # This will call set_state("ACTIVE") if processes are found
+
+        if self.state == "ACTIVE":
+            # If the process check found activity and transitioned to ACTIVE, we are done here.
+            print("Activity found during idle check. Transition to ACTIVE.")
+            return
+
+        # If still IDLE_DETECTING, proceed with counting/looping logic
+        if self.fast_check_timer.isActive():
+            # --- STAGE 1 (Fast Check) Logic ---
+            self.fast_check_counter -= 1
+            print(f"Stage 1 Check: {self.fast_check_counter} remaining.")
+
+            if self.fast_check_counter <= 0:
+                # End of Stage 1. Transition to Stage 2.
+                self.fast_check_timer.stop()
+                print("Stage 1 complete. Starting Stage 2 (Slow Loop).")
+                self.idle_timer.start(IDLE_CHECK_LOOP_MS)
+
+        # If the idle_timer is active, we are already in Stage 2 (Slow Loop).
 
 
     def run_nvidia_smi_status(self):
@@ -291,8 +324,7 @@ class SystemTrayApp(QSystemTrayIcon):
                 if is_suspended:
                     self.set_state("SUSPENDED")
                 elif is_active:
-                    self.set_state("ACTIVE")
-                    self.process_timer.start(PROCESS_POLL_MS)
+                    self.set_state("ACTIVE") # Timer starts in set_state
                 return
 
             # --- Ongoing Polling Logic (For IDLE/SUSPENDED states) ---
@@ -300,17 +332,14 @@ class SystemTrayApp(QSystemTrayIcon):
             if self.state == "IDLE_DETECTING":
                 if is_suspended:
                     # Transition to SUSPENDED is reliable
-                    self.process_timer.stop()
-                    self.set_state("SUSPENDED")
+                    self.set_state("SUSPENDED") # Timer stops in set_state
 
                 # We ignore 'is_active' here to allow the GPU to suspend.
-                # Waking up is handled by the recurring 30s idle_timer loop.
 
             elif self.state == "SUSPENDED":
                 if is_active:
-                    # If we wake up from a deep suspend, immediately assume activity and start polling
-                    self.set_state("ACTIVE")
-                    self.process_timer.start(PROCESS_POLL_MS)
+                    # If we wake up from a deep suspend, immediately assume activity
+                    self.set_state("ACTIVE") # Timer starts in set_state
 
         except FileNotFoundError:
             if self.state not in ["ERROR"]:
