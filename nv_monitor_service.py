@@ -17,8 +17,13 @@ NVIDIA_SMI_STATUS_COMMAND = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.u
 # IMPORTANT: Replace 0000:01:00.0 with your actual NVIDIA GPU PCI address
 RUNTIME_STATUS_PATH = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
 COMMAND_TITLE = "GPU Processes"
-PROCESS_POLL_MS = 2000 # 5 seconds (for nvidia-smi process list)
-STATUS_POLL_MS = 1000   # 1 second (for runtime_status and overall GPU status check)
+PROCESS_POLL_MS = 1000 # (for nvidia-smi process list - when ACTIVE)
+STATUS_POLL_MS = 1000 # (for runtime_status and overall GPU status check)
+
+# --- IDLE TIMEOUT CONFIGURATION ---
+# The timer for recurring check when idle. Set to 30s to be less aggressive.
+IDLE_CHECK_LOOP_MS = 30000
+# ----------------------------------
 
 # ICON CONFIGURATION (Using relative paths for custom icons, falling back to standard names)
 ICON_ACTIVE = "icons/active.png"
@@ -48,6 +53,12 @@ class SystemTrayApp(QSystemTrayIcon):
         # Timer for polling overall status and runtime_status file (frequent)
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.check_status_and_metrics)
+
+        # --- IDLE TIMER (Now set up for continuous loop) ---
+        self.idle_timer = QTimer(self)
+        # Note: setSingleShot(False) is the default, but we ensure it loops
+        self.idle_timer.timeout.connect(self.check_process_after_idle_timeout)
+        # ----------------------
 
         # --- MENU SETUP ---
         self.menu = QMenu()
@@ -124,25 +135,71 @@ class SystemTrayApp(QSystemTrayIcon):
     def set_state(self, new_state):
         """Centralized state machine update and icon switching."""
         if self.state != new_state:
+            old_state = self.state
             self.state = new_state
 
-            # --- UPDATED ICON LOGIC ---
+            # --- UPDATED ICON LOGIC and TIMER MANAGEMENT ---
             if new_state == "SUSPENDED":
                 self.set_icon(ICON_SUSPENDED)
+                self.idle_timer.stop()
+                self.process_timer.stop() # Ensure this is off too
             elif new_state == "IDLE_DETECTING":
                 self.set_icon(ICON_IDLE)
+                # Start the recurring idle check
+                self.idle_timer.start(IDLE_CHECK_LOOP_MS)
+                self.process_timer.stop() # Ensure this is off too
             elif new_state == "ERROR":
                 self.set_icon(ICON_ERROR)
+                self.idle_timer.stop()
+                self.process_timer.stop()
             else: # ACTIVE
                 self.set_icon(ICON_ACTIVE)
+                self.idle_timer.stop()
+                # Note: process_timer is started separately by process check methods
 
-            print(f"State changed to: {new_state}")
+            print(f"State changed from {old_state} to: {new_state}")
 
         self.update_tooltip()
 
+    def force_run_process_check(self):
+        """
+        Forces nvidia-smi process check for menu update or idle timeout loop.
+        It transitions to ACTIVE only if processes are found AND the state is currently not ACTIVE.
+        """
+        try:
+            result = subprocess.run(
+                NVIDIA_SMI_PROCESS_COMMAND,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding='utf-8',
+                timeout=3
+            )
+            parsed_data = self.parse_nvidia_smi_output_processes(result.stdout)
+
+            if parsed_data:
+                # Processes found. Update internal data.
+                self.last_parsed_data = parsed_data
+
+                if self.state != "ACTIVE":
+                    # If processes are found while IDLE/SUSPENDED, switch to ACTIVE.
+                    self.set_state("ACTIVE")
+                    self.process_timer.start(PROCESS_POLL_MS)
+            else:
+                # No processes found, just update internal list.
+                self.last_parsed_data = None
+
+            return parsed_data
+
+        except Exception:
+            self.last_parsed_data = [["Error", "Command Failed"]]
+            self.set_state("ERROR")
+            return self.last_parsed_data
+
+
     def run_nvidia_smi_processes(self):
-        """Runs nvidia-smi for processes. If no processes, switches to suspend detection."""
-        # Note: This is only called when self.state is "ACTIVE"
+        """Runs nvidia-smi for processes. Only used by the frequent process_timer (when ACTIVE)."""
+        # Only run if we are in the ACTIVE state
         if self.state != "ACTIVE":
             return
 
@@ -158,14 +215,26 @@ class SystemTrayApp(QSystemTrayIcon):
             parsed_data = self.parse_nvidia_smi_output_processes(result.stdout)
 
             if not parsed_data:
+                # Processes disappeared, switch to idle detection
                 self.process_timer.stop()
                 self.set_state("IDLE_DETECTING")
 
+            # Update internal data
             self.last_parsed_data = parsed_data
 
         except Exception:
             self.last_parsed_data = [["Error", "Command Failed"]]
             self.set_state("ERROR")
+
+    def check_process_after_idle_timeout(self):
+        """
+        Called by the recurring idle_timer.
+        Forces an nvidia-smi process check to see if any activity started.
+        """
+        if self.state == "IDLE_DETECTING":
+            print(f"Idle check loop ({IDLE_CHECK_LOOP_MS/1000}s) forcing nvidia-smi process check.")
+            self.force_run_process_check()
+
 
     def run_nvidia_smi_status(self):
         """Runs nvidia-smi to get overall GPU status."""
@@ -197,7 +266,10 @@ class SystemTrayApp(QSystemTrayIcon):
         self.update_tooltip()
 
     def check_runtime_status(self, startup_check=False):
-        """Polls the runtime_status file to detect suspend/active events."""
+        """
+        Polls the runtime_status file to detect suspend/active events.
+        Crucially, the IDLE_DETECTING state ignores 'active' status to prevent looping.
+        """
         try:
             with open(RUNTIME_STATUS_PATH, 'r') as f:
                 status = f.read().strip()
@@ -218,11 +290,15 @@ class SystemTrayApp(QSystemTrayIcon):
 
             if self.state == "IDLE_DETECTING":
                 if is_suspended:
-                    self.process_timer.stop() # Stop the process check when suspended
+                    # ONLY transition to SUSPENDED if the file says so.
+                    self.process_timer.stop()
                     self.set_state("SUSPENDED")
+
+                # We ignore 'is_active' here to prevent the IDLE_DETECTING/ACTIVE loop.
 
             elif self.state == "SUSPENDED":
                 if is_active:
+                    # If we wake up from a deep suspend, immediately assume activity and start polling
                     self.set_state("ACTIVE")
                     self.process_timer.start(PROCESS_POLL_MS)
 
@@ -237,7 +313,6 @@ class SystemTrayApp(QSystemTrayIcon):
     def check_status_and_metrics(self, startup_check=False):
         """
         Combined function for status file check and metrics polling.
-        Crucially, run_nvidia_smi_status is only called when state is ACTIVE.
         """
         # 1. ALWAYS check runtime status first to correctly set self.state
         self.check_runtime_status(startup_check)
@@ -247,7 +322,6 @@ class SystemTrayApp(QSystemTrayIcon):
             self.run_nvidia_smi_status()
         else:
             # When SUSPENDED, IDLE_DETECTING, or ERROR, we manually set metrics.
-            display_text = "IDLE" if self.state == "IDLE_DETECTING" else self.state
 
             if self.state == "SUSPENDED" or self.state == "IDLE_DETECTING":
                 self.gpu_status_data = {"utilization": "0%", "memory_used": "0MiB"}
@@ -335,15 +409,23 @@ class SystemTrayApp(QSystemTrayIcon):
         pass
 
     def get_menu_data(self):
-        """Determines the data/message to show in the menu based on the current state."""
+        """
+        Determines the data/message to show in the menu based on the current state.
+        Forces a process check if the app is ACTIVE or IDLE_DETECTING to refresh the menu list.
+        """
+
+        # When menu is opened, we always force a process check to get the latest list
+        if self.state == "ACTIVE" or self.state == "IDLE_DETECTING":
+            self.force_run_process_check()
+
         if self.state == "ACTIVE":
-            # Call process check on menu open to get the latest list before display
-            self.run_nvidia_smi_processes()
             return self.last_parsed_data
         elif self.state == "SUSPENDED":
             return [["Info", "GPU Suspended. No processes."]]
         elif self.state == "IDLE_DETECTING":
-            # Display "IDLE" instead of "IDLE_DETECTING"
+            # If IDLE, display processes only if the forced check above found some
+            if self.last_parsed_data:
+                 return self.last_parsed_data
             return [["Info", "Idle. Monitoring for suspend/activity."]]
         elif self.state == "ERROR":
             return [["Error", "Check path/permissions or command"]]
@@ -353,7 +435,6 @@ class SystemTrayApp(QSystemTrayIcon):
     def update_process_menu(self):
         """
         Dynamically populates the QMenu with process actions or status messages.
-        Fixes the ValueError by robustly clearing and rebuilding the dynamic section.
         """
 
         # 1. Clear all dynamic actions (everything after the metrics action up to the quit action)
@@ -410,9 +491,11 @@ class SystemTrayApp(QSystemTrayIcon):
 
         else:
             # Insert status message if no processes
-            if data:
+            if data and data != [["Error", "Command Failed"]]:
                 # Access data[0][1] only if data is not empty
                 status_action = QAction(data[0][1], self)
+            elif data == [["Error", "Command Failed"]]:
+                status_action = QAction("Error: Command Failed", self)
             else:
                 # Fallback in case get_menu_data unexpectedly returns []
                 status_action = QAction("Status Data Unavailable", self)
