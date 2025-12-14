@@ -51,11 +51,12 @@ class SystemTrayApp(QSystemTrayIcon):
 
         # --- MENU SETUP ---
         self.menu = QMenu()
-        self.menu_header = QAction(f"--- GPU Status ---", self)
-        self.menu_header.setEnabled(False)
 
-        self.menu.addAction(self.menu_header)
-        self.menu.addSeparator()
+        # --- REMOVED MENU HEADER SETUP ---
+        # self.menu_header = QAction(f"--- GPU Status ---", self)
+        # self.menu_header.setEnabled(False)
+        # self.menu.addAction(self.menu_header)
+        # self.menu.addSeparator()
 
         # Action to display GPU metrics
         self.metrics_action = QAction("Utilization: N/A | Memory: N/A", self)
@@ -144,7 +145,7 @@ class SystemTrayApp(QSystemTrayIcon):
             print(f"State changed to: {new_state}")
 
         self.update_tooltip()
-        self.update_menu_header()
+        # self.update_menu_header() # Removed call to update_menu_header
 
     def run_nvidia_smi_processes(self):
         """Runs nvidia-smi for processes. If no processes, switches to suspend detection."""
@@ -327,19 +328,20 @@ class SystemTrayApp(QSystemTrayIcon):
         """
         pass
 
-    def update_menu_header(self):
-        """Updates the header text based on the state."""
-        # Display "IDLE" instead of "IDLE_DETECTING"
-        if self.state == "ACTIVE":
-            self.menu_header.setText(f"--- GPU Active ---")
-        elif self.state == "SUSPENDED":
-            self.menu_header.setText(f"--- GPU Suspended ---")
-        elif self.state == "IDLE_DETECTING":
-            self.menu_header.setText(f"--- GPU Idle ---")
-        elif self.state == "ERROR":
-            self.menu_header.setText(f"--- GPU Error ---")
-        else:
-            self.menu_header.setText(f"--- GPU Status ({self.state}) ---")
+    # --- REMOVED update_menu_header method ---
+    # def update_menu_header(self):
+    #     """Updates the header text based on the state."""
+    #     # Display "IDLE" instead of "IDLE_DETECTING"
+    #     if self.state == "ACTIVE":
+    #         self.menu_header.setText(f"--- GPU Active ---")
+    #     elif self.state == "SUSPENDED":
+    #         self.menu_header.setText(f"--- GPU Suspended ---")
+    #     elif self.state == "IDLE_DETECTING":
+    #         self.menu_header.setText(f"--- GPU Idle ---")
+    #     elif self.state == "ERROR":
+    #         self.menu_header.setText(f"--- GPU Error ---")
+    #     else:
+    #         self.menu_header.setText(f"--- GPU Status ({self.state}) ---")
 
     def get_menu_data(self):
         """Determines the data/message to show in the menu based on the current state."""
@@ -370,6 +372,8 @@ class SystemTrayApp(QSystemTrayIcon):
         for action in self.menu.actions():
             # Start removing after the metrics line
             if action is self.metrics_action:
+                # The separator after metrics also needs to be removed, so we start here.
+                # However, the quit action is always at the end.
                 in_dynamic_section = True
                 continue
 
@@ -386,7 +390,7 @@ class SystemTrayApp(QSystemTrayIcon):
 
         # 2. Update Header/Metrics Text
         data = self.get_menu_data()
-        self.update_menu_header()
+        # self.update_menu_header() # Removed call to update_menu_header
 
         # 3. Insert new dynamic content (Processes list or status message)
 
