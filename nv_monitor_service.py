@@ -50,6 +50,8 @@ class SystemTrayApp(QSystemTrayIcon):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.monitor_logic_flow)
 
+        self.activated.connect(self.on_activated)
+
         self.menu = QMenu()
         
         self.metrics_action = QAction("Utilization: N/A | Memory: N/A", self)
@@ -66,6 +68,11 @@ class SystemTrayApp(QSystemTrayIcon):
 
         self.monitor_logic_flow(startup_check=True)
         self.status_timer.start(STATUS_POLL_MS)
+
+    def on_activated(self, reason):
+        """Handle tray icon activation (e.g., left-click to open Task Manager)."""
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.launch_tm()
 
     def launch_tm(self):
         """Opens or raises the GPU Task Manager window."""
