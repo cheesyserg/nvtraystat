@@ -1,193 +1,222 @@
 import sys
-import subprocess
 import os
-from PyQt6.QtCore import Qt, QTimer, QFileInfo
+import subprocess
+from PyQt6.QtCore import Qt, QTimer, QFileInfo, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QIcon, QAction
-from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow,
-                             QMessageBox, QFileIconProvider)
+from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, 
+                             QFileIconProvider, QMessageBox)
 
-from gpu_task_manager import GpuTaskManager
+try:
+    import pynvml
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
 
 # --- CONFIGURATION ---
+GPU_PCI_ADDR = "0000:01:00.0"
+RUNTIME_STATUS_PATH = f"/sys/bus/pci/devices/{GPU_PCI_ADDR}/power/runtime_status"
 
-# The sysfs path to the GPU's power state; reading this file does not wake the GPU.
-RUNTIME_STATUS_PATH = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
+STATUS_POLL_MS = 1000
+FAST_CHECK_COUNT = 5
+FAST_CHECK_INTERVAL_MS = 2000
+IDLE_CHECK_LOOP_MS = 10000
 
-# Standard NVIDIA-SMI command to query active compute applications.
-NVIDIA_SMI_PROCESS_COMMAND = ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"]
-
-# Standard NVIDIA-SMI command to query hardware utilization and memory metrics.
-NVIDIA_SMI_STATUS_COMMAND = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader"]
-
-# A high-performance shell pipeline that finds PIDs accessing NVIDIA device nodes via /proc.
-PROC_QUERY_CMD = (
-    "find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | "
-    "awk -F/ '!seen[$3]++ { print $3 }'"
-)
-
-# Frequency (in milliseconds) for the master monitoring loop.
-STATUS_POLL_MS = 1000   
-
-# The number of consecutive idle cycles required to verify the GPU can safely enter a passive state.
-STABILITY_THRESHOLD = 5 
-
-# Pathing for custom status icons.
 ICON_ACTIVE = "icons/active.png"
 ICON_IDLE = "icons/idle.png"
 ICON_SUSPENDED = "icons/suspended.png"
 ICON_ERROR = "dialog-error"
 
+class GPUWorker(QObject):
+    data_ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.handle = None
+        self._is_initialized = False
+
+    def _ensure_init(self):
+        """Method 1: Dynamically initialize NVML only when needed."""
+        if not NVML_AVAILABLE: return False
+        if not self._is_initialized:
+            try:
+                pynvml.nvmlInit()
+                self.handle = pynvml.nvmlDeviceGetHandleByPciBusId(GPU_PCI_ADDR.encode())
+                self._is_initialized = True
+                print("NVML Initialized (GPU Wake)")
+            except Exception as e:
+                print(f"NVML Init Error: {e}")
+                return False
+        return True
+
+    def _shutdown(self):
+        """Properly release handles to allow hardware suspension."""
+        if self._is_initialized:
+            try:
+                pynvml.nvmlShutdown()
+                self._is_initialized = False
+                self.handle = None
+                print("NVML Shutdown (Allowing Suspend)")
+            except: pass
+
+    def fetch_update(self):
+        """Optimization 3: Batch queries, but only if NVML can init."""
+        if not self._ensure_init(): return
+
+        data = {"util": "0%", "mem": "0MiB", "procs": []}
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(self.handle)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+            data["util"] = f"{util.gpu}%"
+            data["mem"] = f"{mem_info.used // (1024**2)}MiB"
+
+            # Merge process types
+            procs = (pynvml.nvmlDeviceGetComputeRunningProcesses(self.handle) + 
+                     pynvml.nvmlDeviceGetGraphicsRunningProcesses(self.handle))
+            
+            seen_pids = set()
+            for p in procs:
+                if p.pid not in seen_pids:
+                    try:
+                        name = pynvml.nvmlSystemGetProcessName(p.pid)
+                        data["procs"].append((str(p.pid), name))
+                        seen_pids.add(p.pid)
+                    except: continue
+            
+            self.data_ready.emit(data)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
 class SystemTrayApp(QSystemTrayIcon):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self):
+        super().__init__()
         self.state = "UNKNOWN"
-        self.gpu_status_data = {"utilization": "N/A", "memory_used": "N/A"}
+        self.last_data = {"util": "0%", "mem": "0MiB", "procs": []}
         self.icon_provider = QFileIconProvider()
-        self.tm_window = None 
-        self.last_proc_pids = set()
-        self.stability_counter = 0
+        self.fast_check_counter = 0
 
-        self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self.monitor_logic_flow)
-
-        self.activated.connect(self.on_activated)
+        self.worker_thread = QThread()
+        self.worker = GPUWorker()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.data_ready.connect(self.handle_worker_data)
+        self.worker_thread.start()
 
         self.menu = QMenu()
-        
-        self.metrics_action = QAction("Utilization: N/A | Memory: N/A", self)
+        self.metrics_action = QAction("Initializing...", self)
         self.metrics_action.setEnabled(False)
-        
-        self.tm_btn = QAction(QIcon.fromTheme("utilities-system-monitor"), "Open GPU Task Manager", self)
-        self.tm_btn.triggered.connect(self.launch_tm)
+        self.menu.addAction(self.metrics_action)
+        self.menu.addSeparator()
+        self.task_mgr_separator = self.menu.addSeparator()
+
+        self.task_manager_action = QAction(QIcon.fromTheme("utilities-system-monitor"), "GPU Task Manager", self)
+        self.task_manager_action.triggered.connect(self.open_task_manager)
+        self.menu.addAction(self.task_manager_action)
         
         self.quit_action = QAction(QIcon.fromTheme("application-exit"), "Quit", self)
         self.quit_action.triggered.connect(QApplication.instance().quit)
+        self.menu.addAction(self.quit_action)
 
         self.setContextMenu(self.menu)
-        self.menu.aboutToShow.connect(self.refresh_menu_list)
+        self.menu.aboutToShow.connect(self.update_process_menu)
 
-        self.monitor_logic_flow(startup_check=True)
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.check_hardware_status)
         self.status_timer.start(STATUS_POLL_MS)
 
-    def on_activated(self, reason):
-        """Handle tray icon activation (e.g., left-click to open Task Manager)."""
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.launch_tm()
+        self.idle_timer = QTimer(self)
+        self.idle_timer.timeout.connect(self.worker.fetch_update)
 
-    def launch_tm(self):
-        """Opens or raises the GPU Task Manager window."""
-        if not self.tm_window: self.tm_window = GpuTaskManager()
-        self.tm_window.show()
-        self.tm_window.raise_()
+        self.check_hardware_status(startup=True)
 
-    def set_state(self, new_state):
-        """Updates internal state and refreshes icon."""
-        if self.state != new_state:
-            old_state = self.state
-            self.state = new_state
-            if new_state == "SUSPENDED":
-                self.set_icon(ICON_SUSPENDED)
-                self.gpu_status_data = {"utilization": "0%", "memory_used": "0MiB"}
-                self.last_proc_pids = set()
-            elif new_state == "IDLE":
-                self.set_icon(ICON_IDLE)
-            elif new_state == "ACTIVE":
-                self.set_icon(ICON_ACTIVE)
-            
-            curr = self.icon(); self.setIcon(QIcon()); self.setIcon(curr)
-            print(f"State transition: {old_state} -> {new_state}")
-        self.update_tooltip()
+    def handle_worker_data(self, data):
+        self.last_data = data
+        if self.state == "ACTIVE" and not data["procs"]:
+            self.set_state("IDLE_DETECTING")
+        elif self.state == "IDLE_DETECTING":
+            if data["procs"]:
+                self.set_state("ACTIVE")
+            elif self.fast_check_counter > 0:
+                self.fast_check_counter -= 1
+                if self.fast_check_counter <= 0:
+                    # Shutdown NVML here to let the kernel suspend the device
+                    self.worker._shutdown()
+                    self.idle_timer.start(IDLE_CHECK_LOOP_MS)
+        self.update_ui_text()
 
-    def set_icon(self, path):
-        if os.path.exists(path): self.setIcon(QIcon(path))
-        else: self.setIcon(QIcon.fromTheme(path))
-
-    def monitor_logic_flow(self, startup_check=False):
-        """Highly optimized gated monitoring loop."""
+    def check_hardware_status(self, startup=False):
         try:
             with open(RUNTIME_STATUS_PATH, 'r') as f:
-                hw_status = f.read().strip()
-            
-            if hw_status == "suspended":
-                self.set_state("SUSPENDED")
+                status = f.read().strip()
+
+            if startup:
+                self.set_state("SUSPENDED" if status == "suspended" else "IDLE_DETECTING")
                 return
 
-            proc_res = subprocess.run(PROC_QUERY_CMD, shell=True, capture_output=True, text=True, timeout=1)
-            current_pids = set(proc_res.stdout.strip().split()) if proc_res.stdout.strip() else set()
+            if status == "suspended" and self.state != "SUSPENDED":
+                self.worker._shutdown() # Ensure NVML is off
+                self.set_state("SUSPENDED")
+            elif status == "active" and self.state == "SUSPENDED":
+                self.set_state("IDLE_DETECTING")
 
-            if current_pids != self.last_proc_pids:
-                print(f"Activity Change Detected: {self.last_proc_pids} -> {current_pids}")
-                self.last_proc_pids = current_pids
-                self.stability_counter = 0
-
-            if self.state == "ACTIVE" or self.stability_counter < STABILITY_THRESHOLD:
-                smi_proc = subprocess.run(NVIDIA_SMI_PROCESS_COMMAND, capture_output=True, text=True, timeout=2)
-                self.set_state("ACTIVE" if smi_proc.stdout.strip() else "IDLE")
-                self.poll_hw_metrics()
-                
-                if self.state == "IDLE":
-                    self.stability_counter += 1
-            else:
-                if self.stability_counter == STABILITY_THRESHOLD:
-                    print("State stable. Silencing NVIDIA-SMI to allow suspend.")
-                    self.stability_counter += 1
-                
-                self.metrics_action.setText("Utilization: 0% | Memory: 0MiB".center(60))
-
-        except Exception as e:
-            print(f"Error: {e}")
+            if self.state != "SUSPENDED":
+                # Only poll NVML if we aren't in the long idle loop
+                if not self.idle_timer.isActive():
+                    self.worker.fetch_update()
+        except:
             self.set_state("ERROR")
 
-    def poll_hw_metrics(self):
-        try:
-            res = subprocess.run(NVIDIA_SMI_STATUS_COMMAND, capture_output=True, text=True, timeout=1)
-            parts = [p.strip() for p in res.stdout.strip().split(',')]
-            if len(parts) == 2:
-                self.gpu_status_data = {"utilization": parts[0], "memory_used": parts[1]}
-                self.metrics_action.setText(f"Utilization: {parts[0]} | Memory: {parts[1]}".center(60))
-        except: pass
+    def set_state(self, new_state):
+        if self.state == new_state: return
+        print(f"State: {self.state} -> {new_state}")
+        self.state = new_state
+        self.idle_timer.stop()
 
-    def update_tooltip(self):
-        self.setToolTip(f"GPU: {self.state}\nUtil: {self.gpu_status_data['utilization']}\nMem: {self.gpu_status_data['memory_used']}")
-
-    def get_process_icon(self, pid, name):
-        try:
-            exe = os.readlink(f"/proc/{pid}/exe")
-            icon = self.icon_provider.icon(QFileInfo(exe))
-            if not icon.isNull(): return icon
-        except: pass
-        icon = QIcon.fromTheme(name.lower().split()[0])
-        return icon if not icon.isNull() else QIcon.fromTheme("application-x-executable")
-
-    def refresh_menu_list(self):
-        """Rebuilds the menu visually."""
-        self.menu.clear()
-        
-        self.menu.addAction(self.metrics_action)
-        self.menu.addSeparator()
-
-        if self.state == "SUSPENDED":
-            a = QAction("GPU Suspended", self); a.setEnabled(False)
-            self.menu.addAction(a)
+        if new_state == "IDLE_DETECTING":
+            self.fast_check_counter = FAST_CHECK_COUNT
+            icon = ICON_IDLE
+        elif new_state == "ACTIVE":
+            icon = ICON_ACTIVE
+        elif new_state == "SUSPENDED":
+            icon = ICON_SUSPENDED
+            self.last_data = {"util": "0%", "mem": "0MiB", "procs": []}
         else:
-            display = []
-            for p in self.last_proc_pids:
+            icon = ICON_ERROR
+
+        self.apply_icon(icon)
+
+    def apply_icon(self, path):
+        icon = QIcon(path) if os.path.exists(path) else QIcon.fromTheme(path)
+        self.setIcon(icon)
+
+    def update_ui_text(self):
+        txt = f"Utilization: {self.last_data['util']} | Memory: {self.last_data['mem']}"
+        self.metrics_action.setText(txt.center(60))
+        st = "IDLE" if self.state == "IDLE_DETECTING" else self.state
+        self.setToolTip(f"GPU: {st}\n{txt}")
+
+    def update_process_menu(self):
+        actions = self.menu.actions()
+        metrics_idx = actions.index(self.metrics_action)
+        sep_idx = actions.index(self.task_mgr_separator)
+        for act in actions[metrics_idx + 1 : sep_idx]:
+            self.menu.removeAction(act)
+
+        if self.state in ["ACTIVE", "IDLE_DETECTING"] and self.last_data["procs"]:
+            for pid, name in reversed(self.last_data["procs"]):
                 try:
-                    with open(f"/proc/{p}/comm", "r") as f:
-                        display.append([p, f.read().strip()])
-                except: continue
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                    icon = self.icon_provider.icon(QFileInfo(exe))
+                except: icon = QIcon.fromTheme("application-x-executable")
+                act = QAction(icon, f"[{pid}] {name}", self, enabled=False)
+                self.menu.insertAction(self.task_mgr_separator, act)
+            self.menu.insertSeparator(self.menu.actions()[metrics_idx + 1])
+        else:
+            msg = "GPU Suspended" if self.state == "SUSPENDED" else "No active processes"
+            self.menu.insertAction(self.task_mgr_separator, QAction(msg, self, enabled=False))
 
-            if display:
-                for p, n in reversed(display):
-                    icon = self.get_process_icon(p, n)
-                    self.menu.addAction(QAction(icon, f"[{p}] {n}", self))
-            else:
-                a = QAction("No processes detected", self); a.setEnabled(False)
-                self.menu.addAction(a)
-
-        self.menu.addSeparator()
-        self.menu.addAction(self.tm_btn)
-        self.menu.addAction(self.quit_action)
+    def open_task_manager(self):
+        script = os.path.join(os.path.dirname(__file__), "gpu_task_manager.py")
+        subprocess.Popen([sys.executable, script])
 
 def main():
     app = QApplication(sys.argv)
@@ -196,4 +225,5 @@ def main():
     tray.show()
     sys.exit(app.exec())
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()
