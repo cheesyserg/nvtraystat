@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QTableWidget, QTableWidgetIte
                              QPushButton, QHBoxLayout, QHeaderView, QLabel)
 from PyQt6.QtCore import Qt, QEvent
 
+# High-performance shell pipeline to find PIDs accessing NVIDIA device nodes
 PROC_QUERY_CMD = (
     "find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | "
     "awk -F/ '!seen[$3]++ { "
@@ -22,7 +23,7 @@ class GpuTaskManager(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NVIDIA GPU Task Manager")
-        self.resize(600, 450)
+        self.resize(650, 450)
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         
         self.layout = QVBoxLayout(self)
@@ -38,15 +39,24 @@ class GpuTaskManager(QWidget):
         self.layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
+        
+        # Standard Refresh Button
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh_list)
         
+        # Normal Kill Button: Targets only the specific PID
         self.kill_btn = QPushButton("Kill Process")
         self.kill_btn.setStyleSheet("background-color: #442222; color: white; font-weight: bold;")
-        self.kill_btn.clicked.connect(self.kill_selected)
+        self.kill_btn.clicked.connect(self.kill_normal)
+        
+        # Aggressive Kill Button: Targets all instances by name
+        self.aggressive_kill_btn = QPushButton("Force Kill Process")
+        self.aggressive_kill_btn.setStyleSheet("background-color: #880000; color: white; font-weight: bold;")
+        self.aggressive_kill_btn.clicked.connect(self.kill_aggressive)
         
         btn_layout.addWidget(self.refresh_btn)
         btn_layout.addWidget(self.kill_btn)
+        btn_layout.addWidget(self.aggressive_kill_btn)
         self.layout.addLayout(btn_layout)
         
         self.refresh_list()
@@ -89,10 +99,38 @@ class GpuTaskManager(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(name))
             self.table.setItem(row, 2, QTableWidgetItem(source))
 
-    def kill_selected(self):
+    def kill_normal(self):
+        """Standard kill targeting only the selected PID."""
         item = self.table.currentItem()
         if item:
             pid = self.table.item(self.table.row(item), 0).text()
             if pid and pid.isdigit():
                 subprocess.run(["kill", "-9", pid])
+                print(f">>> Normal Kill: Process {pid} terminated.")
                 self.refresh_list()
+
+    def kill_aggressive(self):
+        """Aggressive kill targeting the PID and all related binary instances."""
+        item = self.table.currentItem()
+        if item:
+            row = self.table.row(item)
+            pid = self.table.item(row, 0).text()
+            name = self.table.item(row, 1).text()
+            
+            if pid and pid.isdigit():
+                # Forcefully kill specific PID
+                subprocess.run(["kill", "-9", pid])
+                
+                # Forcefully kill all processes matching the binary name
+                clean_name = name.split('/')[-1]
+                subprocess.run(["pkill", "-9", "-f", clean_name])
+                
+                print(f">>> Aggressive Kill: {name} and associated tasks terminated.")
+                self.refresh_list()
+
+if __name__ == "__main__":
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication(sys.argv)
+    window = GpuTaskManager()
+    window.show()
+    sys.exit(app.exec())
