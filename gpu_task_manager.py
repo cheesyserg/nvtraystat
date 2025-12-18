@@ -3,9 +3,16 @@ import subprocess
 import os
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, 
                              QPushButton, QHBoxLayout, QHeaderView, QLabel)
-from PyQt6.QtCore import Qt, QEvent
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QEvent
 
-# High-performance shell pipeline to find PIDs accessing NVIDIA device nodes
+# Attempt to import NVML for direct library access
+try:
+    import pynvml
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
+
+# High-performance shell pipeline fallback for non-NVML reported processes
 PROC_QUERY_CMD = (
     "find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | "
     "awk -F/ '!seen[$3]++ { "
@@ -17,7 +24,57 @@ PROC_QUERY_CMD = (
     "}'"
 )
 
-SMI_PROCESS_CMD = ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"]
+class GPUWorker(QObject):
+    """Method 2: Background worker to prevent UI freezing during driver queries."""
+    data_ready = pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self._is_initialized = False
+        self.handle = None
+
+    def _ensure_init(self):
+        if not NVML_AVAILABLE: return False
+        if not self._is_initialized:
+            try:
+                pynvml.nvmlInit()
+                # Get handle for the primary GPU
+                self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self._is_initialized = True
+            except: return False
+        return True
+
+    def fetch_processes(self):
+        """Method 3: Batched query of Compute, Graphics, and System processes."""
+        combined = {}
+        
+        # 1. Try NVML (Direct Library Access)
+        if self._ensure_init():
+            try:
+                # Merge both compute and graphics processes
+                nv_procs = (pynvml.nvmlDeviceGetComputeRunningProcesses(self.handle) + 
+                            pynvml.nvmlDeviceGetGraphicsRunningProcesses(self.handle))
+                
+                for p in nv_procs:
+                    try:
+                        name = pynvml.nvmlSystemGetProcessName(p.pid)
+                        combined[str(p.pid)] = [name, "NVML"]
+                    except: continue
+            except: pass
+
+        # 2. Fallback to /proc shell query
+        try:
+            res = subprocess.run(PROC_QUERY_CMD, shell=True, capture_output=True, text=True, timeout=1)
+            for line in res.stdout.strip().split('\n'):
+                if line:
+                    parts = line.split(' ', 1)
+                    if len(parts) == 2:
+                        pid, name = parts
+                        if pid not in combined:
+                            combined[pid] = [name, "/proc"]
+        except: pass
+
+        self.data_ready.emit(combined)
 
 class GpuTaskManager(QWidget):
     def __init__(self):
@@ -26,8 +83,9 @@ class GpuTaskManager(QWidget):
         self.resize(650, 450)
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         
+        # Layout Setup
         self.layout = QVBoxLayout(self)
-        self.label = QLabel("Active GPU Processes")
+        self.label = QLabel("Active GPU Processes (Auto-Refreshing)")
         self.label.setStyleSheet("font-weight: bold; margin-bottom: 5px;")
         self.layout.addWidget(self.label)
 
@@ -38,18 +96,15 @@ class GpuTaskManager(QWidget):
         self.table.setAlternatingRowColors(True)
         self.layout.addWidget(self.table)
 
+        # Buttons
         btn_layout = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh Now")
+        self.refresh_btn.clicked.connect(self.request_refresh)
         
-        # Standard Refresh Button
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.refresh_list)
-        
-        # Normal Kill Button: Targets only the specific PID
         self.kill_btn = QPushButton("Kill Process")
         self.kill_btn.setStyleSheet("background-color: #442222; color: white; font-weight: bold;")
         self.kill_btn.clicked.connect(self.kill_normal)
         
-        # Aggressive Kill Button: Targets all instances by name
         self.aggressive_kill_btn = QPushButton("Force Kill Process")
         self.aggressive_kill_btn.setStyleSheet("background-color: #880000; color: white; font-weight: bold;")
         self.aggressive_kill_btn.clicked.connect(self.kill_aggressive)
@@ -58,39 +113,46 @@ class GpuTaskManager(QWidget):
         btn_layout.addWidget(self.kill_btn)
         btn_layout.addWidget(self.aggressive_kill_btn)
         self.layout.addLayout(btn_layout)
-        
-        self.refresh_list()
+
+        # Threaded Worker Setup
+        self.worker_thread = QThread()
+        self.worker = GPUWorker()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.data_ready.connect(self.populate_table)
+        self.worker_thread.start()
+
+        # Auto-Refresh Timer
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.request_refresh)
+
+    def showEvent(self, event):
+        """Starts auto-refresh when window is shown."""
+        super().showEvent(event)
+        self.refresh_timer.start(2000) # 2 seconds
+        self.request_refresh()
+
+    def hideEvent(self, event):
+        """Stops auto-refresh when hidden."""
+        super().hideEvent(event)
+        self.refresh_timer.stop()
 
     def changeEvent(self, event):
+        """Auto-close when the window loses focus."""
         if event.type() == QEvent.Type.ActivationChange:
             if not self.isActiveWindow():
                 self.close()
         super().changeEvent(event)
 
-    def fetch_all_processes(self):
-        combined = {}
-        try:
-            res = subprocess.run(SMI_PROCESS_CMD, capture_output=True, text=True, timeout=2)
-            for line in res.stdout.strip().split('\n'):
-                if line and ',' in line:
-                    pid, name = line.split(',', 1)
-                    combined[pid.strip()] = [name.strip(), "nvidia-smi"]
-        except: pass
+    def request_refresh(self):
+        """Signals background worker."""
+        self.worker.fetch_processes()
 
-        try:
-            res = subprocess.run(PROC_QUERY_CMD, shell=True, capture_output=True, text=True, timeout=2)
-            for line in res.stdout.strip().split('\n'):
-                if line:
-                    parts = line.split(' ', 1)
-                    if len(parts) == 2:
-                        pid, name = parts
-                        if pid not in combined:
-                            combined[pid] = [name, "/proc"]
-        except: pass
-        return combined
+    def populate_table(self, processes):
+        selected_pid = None
+        current_row = self.table.currentRow()
+        if current_row != -1:
+            selected_pid = self.table.item(current_row, 0).text()
 
-    def refresh_list(self):
-        processes = self.fetch_all_processes()
         self.table.setRowCount(0)
         for pid, (name, source) in processes.items():
             row = self.table.rowCount()
@@ -98,35 +160,28 @@ class GpuTaskManager(QWidget):
             self.table.setItem(row, 0, QTableWidgetItem(pid))
             self.table.setItem(row, 1, QTableWidgetItem(name))
             self.table.setItem(row, 2, QTableWidgetItem(source))
+            if pid == selected_pid:
+                self.table.selectRow(row)
 
     def kill_normal(self):
-        """Standard kill targeting only the selected PID."""
         item = self.table.currentItem()
         if item:
             pid = self.table.item(self.table.row(item), 0).text()
             if pid and pid.isdigit():
                 subprocess.run(["kill", "-9", pid])
-                print(f">>> Normal Kill: Process {pid} terminated.")
-                self.refresh_list()
+                self.request_refresh()
 
     def kill_aggressive(self):
-        """Aggressive kill targeting the PID and all related binary instances."""
         item = self.table.currentItem()
         if item:
             row = self.table.row(item)
             pid = self.table.item(row, 0).text()
             name = self.table.item(row, 1).text()
-            
             if pid and pid.isdigit():
-                # Forcefully kill specific PID
                 subprocess.run(["kill", "-9", pid])
-                
-                # Forcefully kill all processes matching the binary name
                 clean_name = name.split('/')[-1]
                 subprocess.run(["pkill", "-9", "-f", clean_name])
-                
-                print(f">>> Aggressive Kill: {name} and associated tasks terminated.")
-                self.refresh_list()
+                self.request_refresh()
 
 if __name__ == "__main__":
     from PyQt6.QtWidgets import QApplication
