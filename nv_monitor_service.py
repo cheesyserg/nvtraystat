@@ -10,28 +10,22 @@ from gpu_task_manager import GpuTaskManager
 
 # --- CONFIGURATION ---
 
-# The sysfs path to the GPU's power state; reading this file does not wake the GPU.
+# Path to kernel runtime status; reading this is a low-impact CPU operation.
 RUNTIME_STATUS_PATH = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
 
-# Standard NVIDIA-SMI command to query active compute applications.
+# These commands are only executed when hardware is active and state is unstable.
 NVIDIA_SMI_PROCESS_COMMAND = ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"]
-
-# Standard NVIDIA-SMI command to query hardware utilization and memory metrics.
 NVIDIA_SMI_STATUS_COMMAND = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader"]
 
-# A high-performance shell pipeline that finds PIDs accessing NVIDIA device nodes via /proc.
+# Efficient /proc traversal to detect GPU device node access.
 PROC_QUERY_CMD = (
     "find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | "
     "awk -F/ '!seen[$3]++ { print $3 }'"
 )
 
-# Frequency (in milliseconds) for the master monitoring loop.
 STATUS_POLL_MS = 1000   
+STABILITY_THRESHOLD = 5 # Consecutive idle cycles before silencing driver.
 
-# The number of consecutive idle cycles required to verify the GPU can safely enter a passive state.
-STABILITY_THRESHOLD = 5 
-
-# Pathing for custom status icons.
 ICON_ACTIVE = "icons/active.png"
 ICON_IDLE = "icons/idle.png"
 ICON_SUSPENDED = "icons/suspended.png"
@@ -44,6 +38,8 @@ class SystemTrayApp(QSystemTrayIcon):
         self.gpu_status_data = {"utilization": "N/A", "memory_used": "N/A"}
         self.icon_provider = QFileIconProvider()
         self.tm_window = None 
+        
+        # Optimization: Track the exact set of PIDs to avoid redundant SMI calls.
         self.last_proc_pids = set()
         self.stability_counter = 0
 
@@ -98,22 +94,27 @@ class SystemTrayApp(QSystemTrayIcon):
         else: self.setIcon(QIcon.fromTheme(path))
 
     def monitor_logic_flow(self, startup_check=False):
+        """Highly optimized gated monitoring loop."""
         try:
+            # Gate 1: Read Kernel Status (Zero driver impact).
             with open(RUNTIME_STATUS_PATH, 'r') as f:
                 hw_status = f.read().strip()
             
             if hw_status == "suspended":
                 self.set_state("SUSPENDED")
-                return
+                return # Early exit: Absolute silence while suspended.
 
+            # Gate 2: Fast /proc Scan (Low driver impact).
             proc_res = subprocess.run(PROC_QUERY_CMD, shell=True, capture_output=True, text=True, timeout=1)
             current_pids = set(proc_res.stdout.strip().split()) if proc_res.stdout.strip() else set()
 
+            # Gate 3: PID Change Detection.
             if current_pids != self.last_proc_pids:
-                print(f"Activity Change: {self.last_proc_pids} -> {current_pids}")
+                print(f"Activity Change Detected: {self.last_proc_pids} -> {current_pids}")
                 self.last_proc_pids = current_pids
-                self.stability_counter = 0
+                self.stability_counter = 0 # Activity changed, restart verification.
 
+            # Decision: Only run SMI if hardware is active and state is not yet stable.
             if self.state == "ACTIVE" or self.stability_counter < STABILITY_THRESHOLD:
                 smi_proc = subprocess.run(NVIDIA_SMI_PROCESS_COMMAND, capture_output=True, text=True, timeout=2)
                 self.set_state("ACTIVE" if smi_proc.stdout.strip() else "IDLE")
@@ -122,9 +123,10 @@ class SystemTrayApp(QSystemTrayIcon):
                 if self.state == "IDLE":
                     self.stability_counter += 1
             else:
+                # Stable Idle: Silence the driver to allow suspend.
                 if self.stability_counter == STABILITY_THRESHOLD:
-                    print("Logic: State stable. Stopping nvidia-smi execution to allow suspend.")
-                    self.stability_counter += 1
+                    print("Logic: State stable. Silencing NVIDIA-SMI to allow suspend.")
+                    self.stability_counter += 1 # Ensure message prints once.
                 
                 self.metrics_action.setText("Utilization: 0% | Memory: 0MiB".center(60))
 
@@ -154,6 +156,7 @@ class SystemTrayApp(QSystemTrayIcon):
         return icon if not icon.isNull() else QIcon.fromTheme("application-x-executable")
 
     def refresh_menu_list(self):
+        """Passively populates the menu using cached /proc data."""
         for action in self.menu.actions()[4:-1]: self.menu.removeAction(action)
         if self.state == "SUSPENDED":
             a = QAction("GPU Suspended", self); a.setEnabled(False)
