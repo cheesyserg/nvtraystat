@@ -19,7 +19,7 @@ RUNTIME_STATUS_PATH = f"/sys/bus/pci/devices/{GPU_PCI_ADDR}/power/runtime_status
 STATUS_POLL_MS = 1000
 FAST_CHECK_COUNT = 5
 FAST_CHECK_INTERVAL_MS = 2000
-IDLE_CHECK_LOOP_MS = 10000
+IDLE_CHECK_LOOP_MS = 20000
 
 ICON_ACTIVE = "icons/active.png"
 ICON_IDLE = "icons/idle.png"
